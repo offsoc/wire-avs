@@ -78,6 +78,7 @@ extern "C" {
 #define TMR_CBR_INTERVAL         2500
 #define TMR_RESTART_INTERVAL    10000
 #define TMR_GATHER_TIMEOUT      10000
+#define TMR_NOCAND_TIMEOUT       1500
 
 #define DOUBLE_ENCRYPTION 1
 
@@ -178,6 +179,7 @@ struct peerflow {
 	rtc::scoped_refptr<wire::CbrDetectorRemote> cbr_det_remote;
 	struct tmr tmr_cbr;
 	struct tmr tmr_restart;
+	struct tmr tmr_nocand;
 
 	struct {
 		rtc::scoped_refptr<webrtc::AudioSourceInterface> source;
@@ -239,6 +241,7 @@ enum {
       MQ_PC_RESTART_NOW    = 0x05,
       MQ_PC_RESTART_DELAY  = 0x06,
       MQ_PC_RESTART_CANCEL = 0x07,
+      MQ_PC_GATHER_DELAY   = 0x08,
 
       MQ_DC_ESTAB          = 0x10,
       MQ_DC_OPEN           = 0x11,
@@ -419,6 +422,7 @@ static void md_destructor(void *arg)
 
 	switch(md->id) {
 	case MQ_PC_GATHER:
+	case MQ_PC_GATHER_DELAY:
 		mem_deref(md->u.gather.sdp);
 		mem_deref(md->u.gather.type);
 		break;
@@ -479,6 +483,16 @@ static void set_all_mute(bool muted)
 }
 
 
+void nocand_handler(void *arg)
+{
+        struct peerflow *pf = (struct peerflow*)arg;
+
+        info("pf(%p): calling gather handler after no candidates\n", pf);
+
+	IFLOW_CALL_CB(pf->iflow, gatherh,
+		      pf->iflow.arg);
+}
+
 void timer_restart(void *arg)
 {
 	struct peerflow *pf = (struct peerflow*)arg;
@@ -517,6 +531,10 @@ static void handle_mq(struct peerflow *pf, struct mq_data *md, int id)
 				      pf->iflow.arg);
 			break;
 
+		case MQ_PC_GATHER_DELAY:
+		        tmr_start(&pf->tmr_nocand, TMR_NOCAND_TIMEOUT, nocand_handler, pf);
+			break;
+
 		case MQ_PC_CLOSE:
 			IFLOW_CALL_CB(pf->iflow, closeh,
 				      EINTR, pf->iflow.arg);
@@ -527,6 +545,8 @@ static void handle_mq(struct peerflow *pf, struct mq_data *md, int id)
 			break;
 
 		case MQ_PC_RESTART_DELAY:
+		  tmr_cancel(&pf->tmr_restart);
+		  info("pf(%p): restart delay: %dms at: %llu\n", pf, TMR_RESTART_INTERVAL, tmr_jiffies());
 			tmr_start(&pf->tmr_restart, TMR_RESTART_INTERVAL, timer_restart, pf);
 			break;
 
@@ -1063,6 +1083,26 @@ static void invoke_gather(struct peerflow *pf,
 	push_mq(md);
 }
 
+static void invoke_gather_delayed(struct peerflow *pf,
+				  const webrtc::SessionDescriptionInterface *isdp)
+{
+	std::string sdp_str;
+	struct mq_data *md;
+	const char *type;
+
+	tmr_cancel(&pf->tmr_gather);
+
+	type = SdpTypeToString(isdp->GetType());
+
+	md = (struct mq_data *)mem_zalloc(sizeof(*md), md_destructor);
+	md->id = MQ_PC_GATHER_DELAY;
+	md->pf = pf;
+	str_dup(&md->u.gather.type, type);
+
+	push_mq(md);
+}
+
+
 static void disconnect_timeout_handler(void *arg)
 {
 	struct peerflow *pf;
@@ -1190,40 +1230,11 @@ public:
 
 		info("pf(%p): ice connection state: %s\n",
 		     pf_, ice_connection_state_name(state));
-		
-		switch (state) {
-		case webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionDisconnected:
-			warning("pf(%p): ice connection: %s\n",
-			     pf_, ice_connection_state_name(state));
-
-			SendMQMessage(MQ_PC_RESTART_DELAY);
-			break;
-
-		case webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionFailed:
-			warning("pf(%p): ice connection: %s\n",
-			     pf_, ice_connection_state_name(state));
-
-			SendMQMessage(MQ_PC_RESTART_NOW);
-			break;
-
-		case webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionConnected:
-		case webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionClosed:
-			SendMQMessage(MQ_PC_RESTART_CANCEL);
-			break;
-			
-		default:
-			info("pf(%p): ice connection: %s\n",
-			     pf_, ice_connection_state_name(state));
-			break;
-		}
-			
 	}
 
 	// Called any time the PeerConnectionState changes.
 	virtual void OnConnectionChange (
 	      webrtc::PeerConnectionInterface::PeerConnectionState state) {
-
-		struct mq_data *md;
 		
 		info("pf(%p): connection change: %s\n",
 		     pf_, connection_state_name(state));
@@ -1233,18 +1244,12 @@ public:
 
 		switch (state) {
 		case webrtc::PeerConnectionInterface::PeerConnectionState::kConnected:
+			SendMQMessage(MQ_PC_ESTAB);
+			break;
 
-			md = (struct mq_data *)mem_zalloc(sizeof(*md),
-							  md_destructor);
-			if (!md) {
-				warning("pf(%p): could not alloc md\n", pf_);
-				return;
-			}
-			md->pf = pf_;
-			md->id = MQ_PC_ESTAB;
-
-			push_mq(md);
-			//mqueue_push(g_pf.mq, md->id, md);
+		case webrtc::PeerConnectionInterface::PeerConnectionState::kFailed:
+		        warning("pf(%p): connection failed, restarting...\n", pf_);
+			SendMQMessage(MQ_PC_RESTART_NOW);
 			break;
 			
 		case webrtc::PeerConnectionInterface::PeerConnectionState::kClosed:
@@ -1291,6 +1296,7 @@ public:
 			// Check that we have at least 1 candidate
 			if (pf_->ncands < 1) {
 				info("pc(%p): ice gathering no candidates\n", pf_);
+				invoke_gather_delayed(pf_, isdp);
 
 				/*
 				if (isdp->GetType() == webrtc::SdpType::kOffer) {
@@ -1687,7 +1693,8 @@ public:
 			rtc::scoped_refptr<webrtc::RtpSenderInterface> sender = txrx->sender();
 			webrtc::RtpParameters params = sender->GetParameters();
 
-			if (txrx->media_type() != cricket::MEDIA_TYPE_VIDEO)
+			if (txrx->media_type() != cricket::MEDIA_TYPE_VIDEO
+			    || (mid != "video" && mid != "1"))
 				continue;
 
 			if (pf_->call_type == ICALL_CALL_TYPE_VIDEO ||
@@ -2132,6 +2139,7 @@ static void pf_destructor(void *arg)
 
 	tmr_cancel(&pf->tmr_cbr);
 	tmr_cancel(&pf->tmr_restart);
+	tmr_cancel(&pf->tmr_nocand);
 	pf->video.track = NULL;
 	pf->audio.track = NULL;
 	pf->audio.source = NULL;
@@ -2445,7 +2453,7 @@ int peerflow_add_turnserver(struct iflow *iflow,
 	if (!pf->config)
 		return ENOSYS;
 
-	info("pf_add_turn: %s\n", username, password, url);
+	info("pf(%p): add_turn: %s:%s:%s\n", pf, url, username, password);
 
 	server.urls.push_back(url);
 	//server.uri = std::string(url);
@@ -2520,8 +2528,8 @@ int peerflow_gather_all_turn(struct iflow *iflow, bool offer)
 	}
 	
 	state = pf->peerConn->signaling_state();
-	info("pf(%p): gather in signal state: %s \n",
-	     pf, signal_state_name(state));
+	info("pf(%p): gather in signal state: %s offer=%d\n",
+	     pf, signal_state_name(state), offer);
 
 	if (offer) {
 		webrtc::RTCErrorOr<rtc::scoped_refptr<webrtc::DataChannelInterface>> ch_or_err;
@@ -2651,6 +2659,7 @@ static void pf_tool_handler(const char *tool, void *arg)
 		if (major == 4 && minor == 1) {
 			pf->sdp_needs_munging = true;
 		}
+
 		info("peerflow(%p): set_sft_options: ver: %d.%d"
 		     " selective_audio: %s selective_video: %s"
 		     " sdp_needs_munging: %s\n",
@@ -2706,6 +2715,7 @@ int peerflow_handle_offer(struct iflow *iflow,
 		     "%s\n",
 		     pf, sdp_str);
 	}
+
 
 	webrtc::SdpParseError parse_err;
 	std::unique_ptr<webrtc::SessionDescriptionInterface> sdp =
@@ -2899,7 +2909,7 @@ int peerflow_add_decoders_for_user(struct iflow *iflow,
 	     anon_client(clientid_anon, clientid),
 	     ssrca, ssrcv);
 	lock_write_get(pf->cml.lock);
-	memb = conf_member_find_by_userclient(&pf->cml.list, userid, clientid);
+	memb = conf_member_find_active_by_userclient(&pf->cml.list, userid, clientid);
 	/* Only allow the addition if the ssrcs don't match */
 	if (memb && memb->ssrca == ssrca && memb->ssrcv == ssrcv)
 		return 0;
@@ -2941,7 +2951,7 @@ int peerflow_remove_decoders_for_user(struct iflow *iflow,
 	     anon_client(clientid_anon, clientid));
 
 	lock_write_get(pf->cml.lock);
-	memb = conf_member_find_by_userclient(&pf->cml.list, userid, clientid);
+	memb = conf_member_find_active_by_userclient(&pf->cml.list, userid, clientid);
 	if (memb)
 		memb->active = false;
 	lock_rel(pf->cml.lock);
@@ -3234,7 +3244,8 @@ int peerflow_inc_frame_count(struct peerflow* pf,
 	else
 		cm->audio_frames += frames;
 
-	debug("FRAME: %s.%s a: %u v: %u\n",
+	debug("FRAME(%p): %s.%s a: %u v: %u\n",
+	      pf,
 	      anon_id(userid_anon, cm->userid),
 	      anon_client(clientid_anon, cm->clientid),
 	      cm->audio_frames,

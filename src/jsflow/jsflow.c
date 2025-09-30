@@ -265,6 +265,7 @@ static void gather_timeout_handler(void *arg)
 		flow->iflow.arg);
 }
 
+#if 0
 static void disconnect_timeout_handler(void *arg)
 {
 	struct jsflow *flow = arg;
@@ -274,6 +275,7 @@ static void disconnect_timeout_handler(void *arg)
 	IFLOW_CALL_CB(flow->iflow, restarth,
 		false, flow->iflow.arg);
 }
+#endif
 
 static void stats_timeout_handler(void *arg)
 {
@@ -1615,13 +1617,6 @@ void pc_connection_handler(int self, const char *state)
 			IFLOW_CALL_CB(flow->iflow, rtp_stateh,
 				true, true, flow->iflow.arg);
 		}
-	}
-	else if (streq(state, "disconnected")) {
-		info("flow(%p): connection_handler: disconnected, "
-		     "starting disconnect timer\n", flow);
-
-		tmr_start(&flow->tmr_disconnect, DISCONNECT_TIMEOUT,
-			  disconnect_timeout_handler, flow);
 	}
 	else if (streq(state, "failed")) {
 		if (tmr_isrunning(&flow->tmr_disconnect))

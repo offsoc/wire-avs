@@ -1027,7 +1027,7 @@ function update_tracks(pc: PeerConnection, stream: MediaStream): Promise<void> {
             if (track.kind === 'video' && pc.conv_type !== CONV_TYPE_ONEONONE) {
                 const transceivers = rtc.getTransceivers();
                 for (const trans of transceivers) {
-                    if (trans.mid === 'video' && !!trans.sender) {
+                    if (trans.mid === 'video' || trans.mid === '1')  {
                         pc_log(LOG_LEVEL_INFO, `update_tracks: adjust`)
                         const {params, layerFound} = getEncodingParameter(trans.sender, pc.vstate === PC_VIDEO_STATE_SCREENSHARE)
 
@@ -1338,7 +1338,7 @@ function connectionHandler(pc: PeerConnection) {
   if (!rtc) {
     return;
   }
-  const state = rtc.iceConnectionState;
+  const state = rtc.connectionState;
 
   pc_log(LOG_LEVEL_INFO, `connectionHandler state: ${state}`);
 
@@ -1468,7 +1468,7 @@ function pc_Create(hnd: number, privacy: number, conv_type: number) {
 
   pc.rtc = rtc;
   rtc.onicegatheringstatechange = () => gatheringHandler(pc);
-  rtc.oniceconnectionstatechange = () => connectionHandler(pc);
+  rtc.onconnectionstatechange = () => connectionHandler(pc);
   rtc.onicecandidate = (event) => candidateHandler(pc, event.candidate);
   rtc.onsignalingstatechange = event => signallingHandler(pc);
   rtc.ondatachannel = event => dataChannelHandler(pc, event);

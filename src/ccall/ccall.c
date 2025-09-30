@@ -34,6 +34,7 @@
 #endif
 
 #define CCALL_CBR_ALWAYS_ON 1
+#define RESOLUTION_DEGRADE 0
 
 #define SFT_STATUS_NETWORK_ERROR 1000
 
@@ -470,6 +471,10 @@ static void ccall_reconnect(struct ccall *ccall,
 
 	if (!ccall || !ccall->keystore) {
 		return;
+	}
+
+	if (ccall->state == CCALL_STATE_CONNSENT) {
+	        return;
 	}
 
 	keystore_get_decrypt_states(ccall->keystore,
@@ -1114,6 +1119,7 @@ static void ecall_quality_handler(struct icall *icall,
 		downloss = 10;
 	}
 
+#if RESOLUTION_DEGRADE
 	if (dec_res) {
 		struct le *le;
 		struct list clil = LIST_INIT;
@@ -1142,6 +1148,9 @@ static void ecall_quality_handler(struct icall *icall,
 		}
 		list_flush(&clil);
 	}
+#else
+	(void)dec_res;
+#endif
 
 	ICALL_CALL_CB(ccall->icall, qualityh,
 		      &ccall->icall, 
@@ -2508,8 +2517,6 @@ static void userlist_kg_change_handler(struct userinfo *keygenerator,
 		      anon_id(userid_anon, keygenerator->userid_real),
 		      anon_client(clientid_anon, keygenerator->clientid_real));
 
-		keystore_reset(ccall->keystore);
-
 		if (ccall->request_key) {
 			info("ccall(%p): requesting key resend from %s.%s\n",
 			     ccall,
@@ -2546,7 +2553,8 @@ int ccall_alloc(struct ccall **ccallp,
 		const char *convid,
 		const char *userid_self,
 		const char *clientid,
-		bool is_mls_call)
+		bool is_mls_call,
+		bool meeting)
 {
 	char convid_anon[ANON_ID_LEN];
 	char userid_anon[ANON_ID_LEN];
@@ -2609,6 +2617,7 @@ int ccall_alloc(struct ccall **ccallp,
 	ccall->state = CCALL_STATE_IDLE;
 	ccall->stop_ringing_reason = CCALL_STOP_RINGING_NONE;
 	ccall->is_mls_call = is_mls_call;
+	ccall->meeting = meeting;
 	ccall->metrics.conv_type = is_mls_call ? ICALL_CONV_TYPE_CONFERENCE_MLS : ICALL_CONV_TYPE_CONFERENCE;
 
 	tmr_init(&ccall->tmr_connect);
@@ -3400,6 +3409,9 @@ static int ccall_handle_confstart_check(struct ccall* ccall,
 				should_ring = false;
 			}
 
+			if (ccall->meeting) {
+			         should_ring = false;
+			}
 			ccall->is_ringing = should_ring;
 			set_state(ccall, CCALL_STATE_INCOMING);
 
